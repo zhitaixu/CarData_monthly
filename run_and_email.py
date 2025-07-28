@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fetch Dongchedi monthly sales and email the CSV.
-Supports SMTP or SendGrid. Designed for GitHub Actions or a server cron.
+Dongchedi monthly fetch + email (SMTP) — Final version
+- Auto SSL when SMTP_PORT=465 or SMTP_SSL=true; else STARTTLS (e.g., 587)
+- Robust handling when DCD_PAGE_SIZE secret is empty
+- Optional REPLY_TO
+- Logs are informative but never print secrets
 """
 
 import os
@@ -19,9 +22,15 @@ import requests
 
 BASE_URL = "https://www.dongchedi.com/motor/pc/car/rank_data"
 HEADERS = {
-    "User-Agent": os.environ.get("DCD_USER_AGENT", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"),
+    "User-Agent": os.environ.get(
+        "DCD_USER_AGENT",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124 Safari/537.36"
+    ),
     "Referer": "https://www.dongchedi.com/sales/"
 }
+
+# -------------------- Fetch helpers --------------------
 
 def month_iter(start_yyyymm: int, end_yyyymm: int):
     y, m = divmod(start_yyyymm, 100)
@@ -30,7 +39,6 @@ def month_iter(start_yyyymm: int, end_yyyymm: int):
     to = date(ey, em, 1)
     while cur <= to:
         yield cur.strftime("%Y%m")
-        # handle year rollover
         if cur.month == 12:
             cur = date(cur.year + 1, 1, 1)
         else:
@@ -117,12 +125,16 @@ def write_csv(rows, filename):
         writer.writerows(rows)
     return filename, len(rows)
 
+# -------------------- Email (SMTP) --------------------
+
 def send_email_smtp(subject, body_text, attachments, email_from, email_to_list,
-                    smtp_host, smtp_port, smtp_user, smtp_pass, use_starttls=True):
+                    smtp_host, smtp_port, smtp_user, smtp_pass, use_starttls=True, reply_to=None):
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = email_from
     msg["To"] = ", ".join(email_to_list)
+    if reply_to:
+        msg["Reply-To"] = reply_to
     msg.set_content(body_text)
 
     for att_path in attachments:
@@ -133,83 +145,60 @@ def send_email_smtp(subject, body_text, attachments, email_from, email_to_list,
 
     context = ssl.create_default_context()
     if use_starttls:
+        print(f"[MAIL] Connecting STARTTLS to {smtp_host}:{smtp_port}")
         with smtplib.SMTP(smtp_host, int(smtp_port)) as server:
             server.ehlo()
             server.starttls(context=context)
             server.login(smtp_user, smtp_pass)
             server.send_message(msg)
     else:
+        print(f"[MAIL] Connecting SSL to {smtp_host}:{smtp_port}")
         with smtplib.SMTP_SSL(smtp_host, int(smtp_port), context=context) as server:
             server.login(smtp_user, smtp_pass)
             server.send_message(msg)
 
-def send_email_sendgrid(subject, body_text, attachments, email_from, email_to_list, sendgrid_api_key):
-    # Build SendGrid v3 API request via requests (no SDK needed)
-    files = []
-    # Inline base64 attachments would be standard; to keep it simple and reliable on Actions,
-    # we will attach as base64 per SendGrid API spec.
-    import base64
-    sg_attachments = []
-    for path in attachments:
-        with open(path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-        sg_attachments.append({
-            "content": b64,
-            "type": "text/csv",
-            "filename": os.path.basename(path),
-            "disposition": "attachment"
-        })
-
-    payload = {
-        "personalizations": [{"to": [{"email": e} for e in email_to_list]}],
-        "from": {"email": email_from},
-        "subject": subject,
-        "content": [{"type": "text/plain", "value": body_text}],
-        "attachments": sg_attachments
-    }
-    headers = {
-        "Authorization": f"Bearer {sendgrid_api_key}",
-        "Content-Type": "application/json"
-    }
-    resp = requests.post("https://api.sendgrid.com/v3/mail/send", headers=headers, data=json.dumps(payload), timeout=30)
-    if not (200 <= resp.status_code < 300):
-        raise RuntimeError(f"SendGrid API failed: {resp.status_code} {resp.text}")
+# -------------------- Main --------------------
 
 def main():
-    # Inputs
-    provider = os.environ.get("MAIL_PROVIDER", "SMTP").upper()  # SMTP or SENDGRID
+    # Provider (we use SMTP for 163/QQ etc.)
+    provider = os.environ.get("MAIL_PROVIDER", "SMTP").upper()
+    if provider != "SMTP":
+        raise SystemExit("Only SMTP is enabled in this final script. Set MAIL_PROVIDER=SMTP.")
+
     email_from = os.environ.get("EMAIL_FROM")
-    email_to = os.environ.get("EMAIL_TO")  # allow comma-separated
+    email_to = os.environ.get("EMAIL_TO")
+    reply_to  = os.environ.get("REPLY_TO")
     if not email_to:
         raise SystemExit("EMAIL_TO is required (comma-separated for multiple recipients).")
     email_to_list = [e.strip() for e in email_to.split(",") if e.strip()]
 
-    # Optional fetch config
+    # Optional filter (1=纯电, 2=插混/增程)
     new_energy_env = os.environ.get("DCD_NEW_ENERGY_TYPE")
-    new_energy_type = None
-    if new_energy_env in ("1","2"):
-        new_energy_type = int(new_energy_env)
+    new_energy_type = int(new_energy_env) if new_energy_env in ("1", "2") else None
 
     # Determine the month range
-    force_yyyymm = os.environ.get("FORCE_YYYYMM") or os.environ.get("INPUT_FORCE_MONTH")  # workflow_dispatch support
+    force_yyyymm = (os.environ.get("FORCE_YYYYMM") or os.environ.get("INPUT_FORCE_MONTH") or "").strip()
     if force_yyyymm:
         start_yyyymm = end_yyyymm = int(force_yyyymm)
     else:
-        start_env = os.environ.get("DCD_START_YYYYMM")  # e.g., 202401
+        start_env = (os.environ.get("DCD_START_YYYYMM") or "").strip()
         if start_env:
             start_yyyymm = int(start_env)
             end_yyyymm = int(last_full_month_yyyymm())
         else:
-            # Default: fetch only last full month
             yyyymm = int(last_full_month_yyyymm())
             start_yyyymm = end_yyyymm = yyyymm
 
-    print(f"Fetch range: {start_yyyymm} -> {end_yyyymm} (new_energy_type={new_energy_type})")
+    # Resolve page_size robustly (handle empty secret)
+    raw_ps = (os.environ.get("DCD_PAGE_SIZE") or "").strip()
+    page_size = int(raw_ps) if raw_ps.isdigit() else 150
+
+    print(f"[CONFIG] From={email_from}, To_count={len(email_to_list)}, Provider={provider}")
+    print(f"[CONFIG] Fetch range: {start_yyyymm} -> {end_yyyymm}, PageSize={page_size}, NE_type={new_energy_type or '全部'}")
 
     # Fetch
     all_rows = []
     for mm in month_iter(start_yyyymm, end_yyyymm):
-        page_size = int((os.environ.get("DCD_PAGE_SIZE") or "150").strip())
         month_rows = fetch_month_all(mm, page_size=page_size, new_energy_type=new_energy_type)
         all_rows.extend(month_rows)
 
@@ -222,37 +211,33 @@ def main():
     outname += ".csv"
     csv_path, nrows = write_csv(all_rows, outname)
 
-    # Email
+    # Email via SMTP
+    smtp_host = os.environ.get("SMTP_HOST")
+    smtp_port = os.environ.get("SMTP_PORT", "587")
+    smtp_user = os.environ.get("SMTP_USER")
+    smtp_pass = os.environ.get("SMTP_PASS")
+    if not all([smtp_host, smtp_port, smtp_user, smtp_pass, email_from]):
+        raise SystemExit("SMTP config missing: need SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM.")
+
+    # Use SSL on 465 or when SMTP_SSL=true; otherwise STARTTLS
+    use_starttls = not (smtp_port == "465" or os.environ.get("SMTP_SSL", "").lower() in ("1", "true", "yes"))
+
     subject = f"[Dongchedi] 销量数据 {start_yyyymm}—{end_yyyymm} 共 {nrows} 行"
     body = (
         f"您好，\n\n"
         f"已抓取 {start_yyyymm}—{end_yyyymm} 的销量数据，共 {nrows} 行。\n"
         f"附件为 CSV 文件（UTF-8 带 BOM）。\n\n"
-        f"参数：new_energy_type={new_energy_type or '全部'}；page_size={os.environ.get('DCD_PAGE_SIZE','150')}；"
+        f"参数：new_energy_type={new_energy_type or '全部'}；page_size={page_size}；"
         f"调度时区：America/New_York（逻辑按该时区计算上一个完整月份）。\n\n"
         f"如需强制抓取某月，可在手动触发工作流时填 YYYYMM。\n"
         f"— 自动发送（GitHub Actions / Cron）"
     )
     attachments = [csv_path]
 
-    if provider == "SMTP":
-        smtp_host = os.environ.get("SMTP_HOST")
-        smtp_port = os.environ.get("SMTP_PORT", "587")
-        smtp_user = os.environ.get("SMTP_USER")
-        smtp_pass = os.environ.get("SMTP_PASS")
-        if not all([smtp_host, smtp_port, smtp_user, smtp_pass, email_from]):
-            raise SystemExit("SMTP config missing: need SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM.")
-        send_email_smtp(subject, body, attachments, email_from, email_to_list,
-                        smtp_host, smtp_port, smtp_user, smtp_pass)
-        print("Email sent via SMTP.")
-    elif provider == "SENDGRID":
-        api_key = os.environ.get("SENDGRID_API_KEY")
-        if not (api_key and email_from):
-            raise SystemExit("SENDGRID config missing: need SENDGRID_API_KEY and EMAIL_FROM.")
-        send_email_sendgrid(subject, body, attachments, email_from, email_to_list, api_key)
-        print("Email sent via SendGrid.")
-    else:
-        raise SystemExit("MAIL_PROVIDER must be SMTP or SENDGRID.")
+    send_email_smtp(subject, body, attachments, email_from, email_to_list,
+                    smtp_host, smtp_port, smtp_user, smtp_pass,
+                    use_starttls=use_starttls, reply_to=reply_to)
+    print("Email sent via SMTP.")
 
 if __name__ == "__main__":
     main()
