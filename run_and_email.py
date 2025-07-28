@@ -209,7 +209,8 @@ def main():
     # Fetch
     all_rows = []
     for mm in month_iter(start_yyyymm, end_yyyymm):
-        month_rows = fetch_month_all(mm, page_size=int(os.environ.get("DCD_PAGE_SIZE", "150")), new_energy_type=new_energy_type)
+        page_size = int((os.environ.get("DCD_PAGE_SIZE") or "150").strip())
+        month_rows = fetch_month_all(mm, page_size=page_size, new_energy_type=new_energy_type)
         all_rows.extend(month_rows)
 
     # Write CSV
