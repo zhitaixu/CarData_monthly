@@ -1,0 +1,63 @@
+name: Dongchedi Monthly Email
+
+on:
+  schedule:
+    # Runs at 14:30 UTC on the 6th of every month.
+    # This is 09:30 EST (winter) / 10:30 EDT (summer) in America/New_York.
+    - cron: "30 14 6 * *"
+  workflow_dispatch:
+    inputs:
+      force_month:
+        description: "YYYYMM to fetch (optional, e.g. 202506)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run fetch and email
+        env:
+          MAIL_PROVIDER: ${{ secrets.MAIL_PROVIDER }}  # SMTP or SENDGRID
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+
+          # Optional fetch tuning
+          DCD_START_YYYYMM: ${{ secrets.DCD_START_YYYYMM }}   # e.g., 202401 to build a cumulative file each month
+          DCD_NEW_ENERGY_TYPE: ${{ secrets.DCD_NEW_ENERGY_TYPE }}  # 1=BEV, 2=PHEV/EREV, unset=all
+          DCD_PAGE_SIZE: ${{ secrets.DCD_PAGE_SIZE }}
+          DCD_USER_AGENT: ${{ secrets.DCD_USER_AGENT }}
+
+          # workflow_dispatch input
+          FORCE_YYYYMM: ${{ github.event.inputs.force_month }}
+        run: |
+          python run_and_email.py
+
+      - name: Upload CSV as artifact (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: output-csv
+          path: |
+            *.csv
+          if-no-files-found: warn
